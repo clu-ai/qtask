@@ -1,16 +1,30 @@
 import { getClient } from './RedisConnection.js';
 
 class Publisher {
-    constructor({ log }) {
-        if (!log) {
-            throw new Error("Publisher requiere una instancia de 'log'.");
+    /**
+     * @param {object} options
+     * @param {Logging} options.log - Instancia del logger.
+     * @param {Partitioner} options.partitioner - Instancia del Partitioner.
+     */
+    constructor({ log, partitioner }) {
+        if (!log || !partitioner) {
+            throw new Error("Publisher requiere instancias de 'log' y 'partitioner'.");
         }
         this.log = log;
+        this.partitioner = partitioner;
     }
 
-    async publish(topic, messageData, options = {}) {
-        if (!topic || messageData === undefined || messageData === null) {
-            this.log.error('[Publisher] Se requiere "topic" y "messageData" para publicar.');
+    /**
+     * Publica un mensaje en la partición correcta de un stream de Redis.
+     * @param {string} baseTopic - El nombre base del topic (ej: 'WHATSAPP').
+     * @param {string|number} partitionKey - La clave para determinar la partición.
+     * @param {object|string} messageData - Los datos a publicar.
+     * @param {object} [options={}] - Opciones adicionales para XADD (ej: { id: '...' }).
+     * @returns {Promise<string|null>} - ID del mensaje o null si falla.
+     */
+    async publish(baseTopic, partitionKey, messageData, options = {}) {
+        if (!baseTopic || partitionKey === undefined || partitionKey === null || messageData === undefined || messageData === null) {
+            this.log.error('[Publisher] Se requiere "baseTopic", "partitionKey" y "messageData".');
             return null;
         }
 
@@ -18,54 +32,40 @@ class Publisher {
         let fieldsToSave;
 
         try {
-            const redis = getClient();
+            // 1. Calcular Partición
+            const partitionIndex = this.partitioner.getPartition(partitionKey);
+            const targetStream = this.partitioner.getPartitionStreamName(baseTopic, partitionIndex);
 
-            // --- Log de Depuración 1 ---
-            this.log.debug(`[Publisher-DEBUG] Recibido para publicar en '${topic}':`, messageData);
-            // --- Fin Log 1 ---
+            this.log.debug(`[Publisher] Clave '${partitionKey}' mapeada a partición ${partitionIndex} (Stream: ${targetStream})`);
 
+            // 2. Preparar Campos (lógica anterior sin cambios)
+            const messageIdToUse = options.id || '*';
+            let fieldsToSave;
             if (typeof messageData === 'object' && !Array.isArray(messageData)) {
-                this.log.debug(`[Publisher-DEBUG] Procesando como objeto.`);
-
+                // ... (lógica para aplanar objeto) ...
                 fieldsToSave = Object.entries(messageData).flat();
-
-                // --- Log de Depuración 2 ---
-                this.log.debug(`[Publisher-DEBUG] Resultado de Object.entries().flat():`, fieldsToSave);
-                // --- Fin Log 2 ---
-
-                if (fieldsToSave.some(item => item === undefined || item === null)) {
-                     this.log.warn(`[Publisher] messageData objeto contenía undefined/null, publicando como string: ${JSON.stringify(messageData)}`);
-                     fieldsToSave = ['message', JSON.stringify(messageData)];
-                } else if (fieldsToSave.length === 0) { // La condición problemática
-                     // --- Log de Depuración 3 ---
-                     this.log.warn(`[Publisher-DEBUG] ¡¡¡ fieldsToSave.length es 0 !!! El messageData original fue:`, messageData);
-                     // --- Fin Log 3 ---
-                     this.log.warn(`[Publisher] messageData objeto resultó vacío, publicando placeholder.`);
-                     fieldsToSave = ['_placeholder', 'empty_object'];
-                }
-                 // Si no es ninguno de los anteriores, fieldsToSave ya tiene el valor correcto aplanado.
-
+                if (fieldsToSave.some(item => item === undefined || item === null)) { /*...*/ fieldsToSave = ['message', JSON.stringify(messageData)]; }
+                else if (fieldsToSave.length === 0) { /*...*/ fieldsToSave = ['_placeholder', 'empty_object']; }
             } else {
-                this.log.debug(`[Publisher-DEBUG] Procesando como NO-objeto (o array).`);
                 fieldsToSave = ['message', typeof messageData === 'string' ? messageData : JSON.stringify(messageData)];
             }
 
-             // --- Log de Depuración 4 ---
-             this.log.debug(`[Publisher-DEBUG] Campos finales para XADD:`, fieldsToSave);
-             // --- Fin Log 4 ---
+            this.log.debug(`[Publisher] Publicando en '${targetStream}' ID '${messageIdToUse}', Campos:`, fieldsToSave);
 
-            const publishedId = await redis.xadd(topic, messageIdToUse, ...fieldsToSave);
+            // 3. Ejecutar XADD en la partición correcta
+            const redis = getClient();
+            const publishedId = await redis.xadd(targetStream, messageIdToUse, ...fieldsToSave);
 
-            this.log.info(`[Publisher] Mensaje publicado en '${topic}' con ID: ${publishedId}`);
+            this.log.info(`[Publisher] Mensaje publicado en '${targetStream}' con ID: ${publishedId}`);
             return publishedId;
 
         } catch (error) {
             // ... (manejo de errores sin cambios) ...
-             if (error.message.includes('[RedisConnection]')) {
-                 this.log.error(`[Publisher] No se pudo publicar - Redis no conectado.`);
-             } else {
+            if (error.message.includes('[RedisConnection]')) {
+                this.log.error(`[Publisher] No se pudo publicar - Redis no conectado.`);
+            } else {
                 this.log.error(`[Publisher] Error al publicar mensaje en '${topic}':`, error);
-             }
+            }
             return null;
         }
     }

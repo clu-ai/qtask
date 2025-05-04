@@ -4,6 +4,8 @@ import Logging from './Logging.js';
 // Importa la clase que gestiona los consumidores
 import ConsumerManager from './ConsumerManager.js';
 
+import Partitioner from './Partitioner.js';
+
 // Importa la clase que gestiona la publicación de mensajes
 import Publisher from './Publisher.js';
 
@@ -14,6 +16,7 @@ class QTask {
     /**
      * Crea la instancia principal de QTask.
      * @param {object} options - Opciones de configuración.
+     * @param {number} options.TOTAL_PARTITIONS - Número de particiones para el particionador.
      * @param {string} options.REDIS_HOST - Host de Redis.
      * @param {number} options.REDIS_PORT - Puerto de Redis.
      * @param {string} [options.REDIS_USERNAME] - Usuario de Redis (opcional).
@@ -30,6 +33,10 @@ class QTask {
             throw new Error('QTask requiere al menos REDIS_HOST y REDIS_PORT en las opciones.');
         }
 
+        if (!Number.isInteger(options.TOTAL_PARTITIONS) || options.TOTAL_PARTITIONS <= 0) {
+            throw new Error("QTask requiere 'TOTAL_PARTITIONS' entero y positivo.");
+        }
+
         this.config = options; // Guardar configuración original si se necesita
 
         // 1. Inicializar Logger
@@ -39,7 +46,14 @@ class QTask {
             useColors: options.logUseColors !== false,
             timestampFormat: options.logTimestampFormat || 'iso'
         });
+
+        this.totalPartitions = options.TOTAL_PARTITIONS;
+
         this.log.info('[QTask] Logger inicializado.');
+
+        this.partitioner = new Partitioner(this.totalPartitions);
+
+        this.log.info(`[QTask] Partitioner inicializado con ${this.totalPartitions} particiones.`);
 
         // Las instancias de Redis, Publisher y Manager se inicializan de forma asíncrona en connect
         this.redisClient = null;
@@ -63,11 +77,11 @@ class QTask {
         try {
             // Pasar solo las opciones relevantes de Redis a connectRedis
             const redisOpts = {
-                 host: this.config.REDIS_HOST,
-                 port: this.config.REDIS_PORT,
-                 username: this.config.REDIS_USERNAME,
-                 password: this.config.REDIS_PASSWORD,
-                 ...(this.config.redisOptions || {}) // Mezclar opciones adicionales si se proporcionan
+                host: this.config.REDIS_HOST,
+                port: this.config.REDIS_PORT,
+                username: this.config.REDIS_USERNAME,
+                password: this.config.REDIS_PASSWORD,
+                ...(this.config.redisOptions || {}) // Mezclar opciones adicionales si se proporcionan
             };
             // Conectar usando el módulo centralizado
             this.redisClient = await connectRedis(redisOpts, this.log);
@@ -75,8 +89,8 @@ class QTask {
             this.log.info('[QTask] Conexión Redis establecida.');
 
             // Inicializar Publisher y ConsumerManager DESPUÉS de conectar
-            this.publisher = new Publisher({ log: this.log });
-            this.consumerManager = new ConsumerManager({ log: this.log }); // Ya no necesitan redis explícito
+            this.publisher = new Publisher({ log: this.log, partitioner: this.partitioner });
+            this.consumerManager = new ConsumerManager({ log: this.log, partitioner: this.partitioner, totalPartitions: this.totalPartitions }); // Ya no necesitan redis explícito
             this.log.info('[QTask] Publisher y ConsumerManager inicializados.');
 
         } catch (error) {
@@ -91,35 +105,48 @@ class QTask {
      * @param {object} options - Opciones de registro (topic, group, handler, etc.)
      * @param {string} options.topic
      * @param {string} options.group
-     * @param {function} options.handler - async (id, data, log) => {}
+     * @param {function} options.handler - async (id, data, log, partitionIndex) => {}
+     * @param {object} [options.partitioning] - Configuración de cómo este worker maneja las particiones.
+     * @param {number} [options.partitioning.instanceId=0] - ID de esta instancia (0-based). Obtener de env var.
+     * @param {number} [options.partitioning.instanceCount=1] - Total de instancias corriendo. Obtener de env var.
      * @param {string} [options.consumerId]
      * @param {number} [options.blockTimeoutMs]
-     * @returns {Promise<Consumer>}
+     * @returns {Promise<void>}
      * @throws {Error} Si no está conectado o el registro falla.
      */
     async register(options) {
         if (!this.isConnected || !this.consumerManager) {
             throw new Error('QTask no está conectado. Llama a connect() antes de registrar.');
         }
-        // Delega al ConsumerManager
-        return this.consumerManager.register(options);
+        // El manager decidirá qué particiones manejar y creará los Consumers necesarios.
+        return this.consumerManager.register({
+            topic: options.topic, // Renombrado para claridad
+            group: options.group,
+            handler: options.handler,
+            partitioning: options.partitioning, // Pasa la config de particionamiento
+            consumerIdBase: options.consumerId, // Renombrado para claridad
+            blockTimeoutMs: options.blockTimeoutMs,
+            claimIntervalMs: options.claimIntervalMs,
+            minIdleTimeMs: options.minIdleTimeMs,
+        });
     }
 
     /**
      * Publica un mensaje en un topic específico.
      * @param {string} topic
+     * @param {string|number} partitionKey - Clave para calcular la partición.
      * @param {object|string} messageData
      * @param {object} [options={}] - Opciones para XADD (ej: { id: '...' })
      * @returns {Promise<string|null>} - ID del mensaje o null si falla.
      * @throws {Error} Si no está conectado.
      */
-    async publish(topic, messageData, options = {}) {
+    async publish(topic, partitionKey, messageData, options = {}) {
         if (!this.isConnected || !this.publisher) {
-             // Podríamos lanzar un error o intentar conectar aquí si no está conectado
-             throw new Error('QTask no está conectado. Llama a connect() antes de publicar.');
+            // Podríamos lanzar un error o intentar conectar aquí si no está conectado
+            throw new Error('QTask no está conectado. Llama a connect() antes de publicar.');
         }
         // Delega al Publisher
-        return this.publisher.publish(topic, messageData, options);
+        return this.publisher.publish(topic, partitionKey, messageData, options);
     }
 
     /**
@@ -131,7 +158,7 @@ class QTask {
         if (this.consumerManager) {
             await this.consumerManager.stopAll();
         } else {
-             this.log.info('[QTask] No hay ConsumerManager para detener.');
+            this.log.info('[QTask] No hay ConsumerManager para detener.');
         }
         await disconnectRedis(); // Llama a la desconexión centralizada
         this.isConnected = false;
