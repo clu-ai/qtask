@@ -1,0 +1,19 @@
+{
+  "name": "qtask",
+  "version": "1.0.0",
+  "description": "Simple library for managing messaging using Redis Stream.",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "cross-env NODE_ENV=development node --watch ./src/index.js",
+    "prod": "cross-env NODE_ENV=production node ./src/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cross-env": "^7.0.3",
+    "dotenv": "^16.5.0",
+    "ioredis": "^5.6.1"
+  }
+}
